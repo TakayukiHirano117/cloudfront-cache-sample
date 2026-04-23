@@ -1,81 +1,230 @@
-# 手動構築手順書: メディア用 S3 + CloudFront（署名 URL）、Next.js on Amplify、前段 CloudFront
+# 手動構築完全手順: S3 + CloudFront 署名 URL + Next.js(Amplify) + 前段 CloudFront
 
-このドキュメントはサンプルアプリを本番に近い形で動かすための **コンソール中心の手順** です。一次ソースとして AWS 公式ドキュメントへのリンクを併記します。
+この手順書だけで、サンプルの構築・確認・切り分けまで完了できるように作っている。  
+対象はこのリポジトリの実装（`src/lib/signFacePhotoUrl.ts`, `src/lib/cloudFrontMediaConfig.ts`, `src/data/mockUser.ts`）に一致。
 
-## なぜ S3 + CloudFront が「セキュアになり得る」か
+---
 
-AWS はプライベート配信を次のように整理しています（[Serve private content with signed URLs and signed cookies](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/PrivateContent.html)）。
+## 0. 目的と最終形
 
-1. **CloudFront エッジでの制御**  
-   信頼できるキーグループに紐づく配信では、**署名付き URL または署名付き Cookie** を要求できます。署名の検証に通らないリクエストはオブジェクトを返しません。
+### 目的
 
-2. **S3 直リンクの遮断（推奨）**  
-   **OAC（Origin Access Control）** で「CloudFront からの読み取りのみ」を許可し、S3 の URL によるバイパスを防ぎます（[Restrict access to an Amazon S3 origin](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/private-content-restricting-access-to-s3.html)）。
+- 顔写真（PII）を **S3 に非公開保存**
+- 配信は **CloudFront キャッシュ** を使って高速化
+- 閲覧は **CloudFront 署名 URL** で制限
+- アプリ（Next.js）は **Amplify Hosting**
+- ユーザー入口は **前段 CloudFront**（Amplify の前）
 
-**注意:** キャッシュは主にパフォーマンス向けです。**有効な署名付き URL が漏洩した場合、その期限内は取得され得ます**。期限・IP 条件・短めの TTL でリスクを下げます。顔写真など PII では、ログ・Referer・ブラウザ履歴への残り方も設計対象に含めてください。
+### 最終形（データフロー）
 
-## アプリが期待する環境変数（Amplify / ローカル）
+1. ブラウザが前段 CloudFront 経由で Next.js を表示
+2. Next.js サーバーが CloudFront 署名 URL を発行
+3. ブラウザが署名 URL でメディア用 CloudFront にアクセス
+4. メディア用 CloudFront が OAC 経由で S3 から取得
+5. 署名不正・期限切れ・非許可なら CloudFront が拒否
 
-| 変数名 | 説明 |
-|--------|------|
-| `CLOUDFRONT_MEDIA_DOMAIN` | メディア用ディストリビューションのドメイン（例: `d111111abcdef8.cloudfront.net`）。`https://` 付きでも可。 |
-| `CLOUDFRONT_KEY_PAIR_ID` | CloudFront のキーペア ID（コンソールの公開鍵 ID）。 |
-| `CLOUDFRONT_PRIVATE_KEY` | 上記キーペアに対応する **PEM 形式の秘密鍵全文**。改行はそのまま、または `\n` にエスケープして 1 行で格納（アプリ側で `\n` を実改行に戻します）。 |
-| `CLOUDFRONT_URL_TTL_SECONDS` | 任意。署名の有効期限（秒）。未設定時は `3600`。 |
+---
 
-秘密鍵は **リポジトリに含めない** こと。Amplify のシークレット環境変数に保存してください。
+## 1. 一次ソース（必読）
 
-## A. メディア（顔写真）: S3 + CloudFront + OAC + 署名 URL
+以下はすべて AWS 公式ドキュメント。
 
-### A-1. S3 バケット
+- CloudFront Private Content（署名 URL / Cookie の全体像）  
+  [https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/PrivateContent.html](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/PrivateContent.html)
+- S3 オリジンを OAC で制限  
+  [https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/private-content-restricting-access-to-s3.html](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/private-content-restricting-access-to-s3.html)
+- Trusted signers / Key groups  
+  [https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/private-content-trusted-signers.html](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/private-content-trusted-signers.html)
+- キャッシュ TTL  
+  [https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/Expiration.html](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/Expiration.html)
+- CloudFront カスタムオリジン設定  
+  [https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/DownloadDistValuesOrigin.html](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/DownloadDistValuesOrigin.html)
+- CloudFront CNAME / カスタムドメイン  
+  [https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/CNAMEs.html](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/CNAMEs.html)
+- S3 パブリックアクセスブロック  
+  [https://docs.aws.amazon.com/AmazonS3/latest/userguide/access-control-block-public-access.html](https://docs.aws.amazon.com/AmazonS3/latest/userguide/access-control-block-public-access.html)
+- Amplify Hosting  
+  [https://docs.aws.amazon.com/amplify/latest/userguide/welcome.html](https://docs.aws.amazon.com/amplify/latest/userguide/welcome.html)
 
-1. S3 でバケットを作成する。パブリックアクセスはブロックしたままにする（[Blocking public access to your S3 storage](https://docs.aws.amazon.com/AmazonS3/latest/userguide/access-control-block-public-access.html)）。
-2. テスト用の顔写真をアップロードする。オブジェクトキーはアプリのモックと一致させる（既定: `users/demo/face.jpg` は [src/data/mockUser.ts](../src/data/mockUser.ts) で定義）。
+---
 
-### A-2. CloudFront ディストリビューション（メディア用）
+## 2. このリポジトリが前提にしている値
 
-1. CloudFront で新規ディストリビューションを作成し、オリジンに上記バケットを指定する。
-2. **Origin access** で OAC を作成し、その OAC をオリジンに関連付ける（[Restrict access to an Amazon S3 origin](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/private-content-restricting-access-to-s3.html)）。
-3. コンソールのガイドに従い、**バケットポリシー** を更新し、当該ディストリビューションからの `s3:GetObject` のみを許可する。
+### オブジェクトキー
 
-### A-3. 信頼できるキーと署名付き URL 必須化
+- 顔写真キーは `src/data/mockUser.ts` の `photoObjectKey` を使う。
+- 現在値は `users/demo/face.png`。  
+  S3 に置くキーをこれと一致させること（拡張子も含めて完全一致）。
 
-1. RSA 2048 または ECDSA 256 の鍵ペアを用意する（[Create key pairs for your signers](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/PrivateContent.html#private-content-creating-cloudfront-key-pairs)）。
-2. **公開鍵** を CloudFront の **キーグループ** に登録し、メディア用ディストリビューションの対象 **キャッシュビヘイビア** にそのキーグループを関連付ける（[Specify signers that can create signed URLs and signed cookies](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/private-content-trusted-signers.html)）。
-3. そのビヘイビアで **Restrict viewer access (Use signed URLs or signed cookies)** を有効にする。
-4. **キャッシュ TTL** はサンプル用途なら数分〜数十分程度にし、署名の意図と齟齬が出ないようにする（TTL と署名期限の関係は [Managing how long content stays in the cache (expiration)](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/Expiration.html) などで設計）。
+### 環境変数（実装上必須）
 
-### A-4. 署名の実装（本リポジトリ）
+`src/lib/cloudFrontMediaConfig.ts` の仕様どおり。
 
-アプリは `@aws-sdk/cloudfront-signer` の `getSignedUrl` を使用します（[npm の README](https://www.npmjs.com/package/@aws-sdk/cloudfront-signer) および AWS の [Code examples for creating a signature](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/PrivateCFSignatureCodeAndExamples.html)）。
+| 変数 | 必須 | 説明 |
+|---|---|---|
+| `CLOUDFRONT_MEDIA_DOMAIN` | 必須 | メディア用 CloudFront ドメイン。`dxxxx.cloudfront.net` か `https://dxxxx.cloudfront.net` |
+| `CLOUDFRONT_KEY_PAIR_ID` | 必須 | 署名に使う CloudFront 公開鍵 ID |
+| `CLOUDFRONT_PRIVATE_KEY` | 必須 | PEM 秘密鍵全文（改行そのまま or `\n` エスケープ） |
+| `CLOUDFRONT_URL_TTL_SECONDS` | 任意 | 署名有効期限（秒）。未設定時 `3600` |
 
-## B. Next.js on AWS Amplify Hosting
+補足:
+- 実装は `\n` エスケープを実改行に戻す。
+- `CLOUDFRONT_URL_TTL_SECONDS` は `<= 0` だと無効扱い（URL 生成しない）。
 
-1. [Amplify Hosting](https://docs.aws.amazon.com/amplify/latest/userguide/welcome.html) でアプリをホストし、このリポジトリを接続する。
-2. ビルド仕様はリポジトリの `pnpm-lock.yaml` に合わせ、インストールと `pnpm run build` が通るようにする（Amplify のビルドイメージと `pnpm` の有効化はコンソール／`amplify.yml` で調整）。
-3. 上記の環境変数を Amplify の **環境変数** に設定する。`CLOUDFRONT_PRIVATE_KEY` はシークレット扱いとする。
-4. デプロイ完了後、Amplify が表示する **デフォルトドメイン**（例: `main.xxxxx.amplifyapp.com`）をメモする。次節のオリジンに使用する。
+---
 
-## C. アプリ前段の CloudFront（Amplify の手前）
+## 3. 構築前チェックリスト
 
-Amplify 自体も CDN 背後ですが、本サンプルでは **別の CloudFront** をユーザー向けの入口に置く構成とします。
+- AWS アカウントに CloudFront / S3 / Amplify / ACM / Route53 操作権限がある
+- 顔写真データの取り扱いルール（社内規定）が確認済み
+- 秘密鍵をコード管理に入れない運用が決まっている
+- 今回使うドメイン（任意）を決めている
 
-1. CloudFront で **新規ディストリビューション** を作成する。
-2. **オリジン** に Amplify のデフォルトドメインを **カスタムオリジン** として追加する。プロトコルは **HTTPS only** を推奨（[Viewer protocol policy](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/DownloadDistValuesCacheBehavior.md#DownloadDistValuesViewerProtocolPolicy)）。
-3. **Origin の設定** で、オリジンに送る **Host ヘッダー** を Amplify のホスト名に合わせる（カスタムオリジンではオリジンドメインとの整合が重要。[Origin settings](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/DownloadDistValuesOrigin.html)）。
-4. デフォルトルートオブジェクトは、SSR の `/` をオリジンに委譲する前提では不要なことが多い。動かない場合はビヘイビアとオリジンのパスを確認する。
-5. 独自ドメインを使う場合、**ACM**（リージョンに注意: CloudFront に紐づける証明書は **us-east-1** の場合がある）で証明書を発行し、ディストリビューションの **Alternate domain name (CNAME)** に設定する（[Using custom URLs](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/CNAMEs.html)）。
-6. Route 53 などで、ユーザー向けドメインの **エイリアス A/AAAA** をこのディストリビューションに向ける。
-7. （任意）[AWS WAF](https://docs.aws.amazon.com/waf/latest/developerguide/cloudfront-features.html) を関連付け、レート制限やマネージドルールを検討する。
+---
 
-## D. 動作確認チェックリスト
+## 4. 手順A: メディア用 S3 + CloudFront + OAC + 署名必須
 
-1. メディアの CloudFront URL に **署名なし** でアクセスし、**403** 等で拒否されること。
-2. アプリ画面で顔写真が表示されること（サーバーが生成した **署名付き URL** 経由）。
-3. 署名の有効期限切れ後、同じ URL で **取得できない** こと。
-4. S3 のオブジェクト URL を直接叩き、**アクセス拒否** であること（OAC とバケットポリシーが正しい場合）。
+## A-1. S3 バケット作成
 
-## 本サンプルの限界（アプリ設計）
+1. S3 コンソールで新規バケット作成
+2. 「Block all public access」を有効のままにする
+3. バケットに `users/demo/face.png` をアップロード
 
-- 認証（Cognito 等）は含みません。ページに到達したクライアントは誰でも署名 URL を得られるため、**本番の PII 配信では認可レイヤ** が別途必要です。
-- 顔写真の取り扱いでは、組織のプライバシー・ログ保持ポリシーに従ってください。
+## A-2. メディア用 CloudFront Distribution 作成
+
+1. CloudFront で `Create distribution`
+2. Origin domain に上記 S3 バケットを指定
+3. Origin access は **Origin access control settings (recommended)** を選択
+4. OAC を新規作成して関連付け
+5. 保存後、CloudFront コンソールの案内どおり S3 バケットポリシーを更新
+
+ポイント:
+- OAC が効いていれば S3 直アクセスを遮断しやすい（一次ソース: OAC ドキュメント）
+
+## A-3. 署名 URL 必須化（キーグループ）
+
+1. CloudFront の `Public keys` で公開鍵を登録
+2. `Key groups` でキーグループ作成し公開鍵を紐づけ
+3. メディア用 Distribution の対象 Behavior を編集
+4. `Restrict viewer access` を有効化
+5. `Trusted key groups` に作成したキーグループを選択
+
+署名の設計指針:
+- URL 有効期限は短めにする（例: 5分〜60分）
+- 必要ならカスタムポリシーで IP 制限を追加（CloudFront 仕様範囲）
+
+---
+
+## 5. 手順B: Next.js を Amplify Hosting に配置
+
+1. Amplify Hosting で Git リポジトリ接続
+2. このリポジトリを対象ブランチでデプロイ設定
+3. Environment variables に以下を登録
+   - `CLOUDFRONT_MEDIA_DOMAIN`
+   - `CLOUDFRONT_KEY_PAIR_ID`
+   - `CLOUDFRONT_PRIVATE_KEY`（シークレット）
+   - `CLOUDFRONT_URL_TTL_SECONDS`（任意）
+4. 初回デプロイ完了後、Amplify のデフォルトドメインを控える  
+   例: `main.xxxxx.amplifyapp.com`
+
+注意:
+- 秘密鍵は漏えい時ローテーション対象。公開鍵差し替え手順を運用に含めること
+
+---
+
+## 6. 手順C: 前段 CloudFront（Amplify の手前）
+
+1. CloudFront で新規 Distribution 作成
+2. Origin に Amplify デフォルトドメインを **Custom origin** として設定
+3. Origin protocol policy は HTTPS only
+4. Viewer protocol policy も Redirect HTTP to HTTPS か HTTPS only を選択
+5. デフォルト behavior は全パス `/*` を Amplify へ
+
+独自ドメインを使う場合:
+
+1. ACM で証明書を作成（CloudFront で使う証明書リージョン要件に従う）
+2. Distribution の Alternate domain name にドメインを設定
+3. 証明書を関連付け
+4. Route53 で Alias A/AAAA を前段 CloudFront に向ける
+
+---
+
+## 7. 動作確認（必須）
+
+## 確認1: 署名なしアクセス拒否
+
+- `https://<media_cf_domain>/users/demo/face.png` に直接アクセス
+- 期待: 403（または拒否応答）
+
+## 確認2: アプリ経由の表示成功
+
+- 前段 CloudFront または Amplify ドメインでアプリを開く
+- ユーザーカードに顔写真が表示される
+
+## 確認3: 期限切れ拒否
+
+- 生成された署名 URL を期限後に再アクセス
+- 期待: 403
+
+## 確認4: S3 直アクセス拒否
+
+- S3 オブジェクト URL へ直接アクセス
+- 期待: AccessDenied
+
+---
+
+## 8. 典型トラブルと対処
+
+## 症状A: 画像が出ない（プレースホルダ表示）
+
+原因候補:
+- 必須環境変数不足
+- 秘密鍵フォーマット不正
+- TTL が不正値
+
+対処:
+- `CLOUDFRONT_MEDIA_DOMAIN` / `CLOUDFRONT_KEY_PAIR_ID` / `CLOUDFRONT_PRIVATE_KEY` を確認
+- `CLOUDFRONT_PRIVATE_KEY` が `BEGIN ... PRIVATE KEY` を含むか確認
+- 改行はそのままか `\n` エスケープかを確認
+
+## 症状B: 署名 URL でも 403
+
+原因候補:
+- Key group 未関連付け
+- 間違った Key pair ID / 秘密鍵
+- Behavior の対象パスがずれている
+- 署名 URL のオブジェクトキー不一致（`.png` / `.jpg` など）
+
+対処:
+- Behavior の `Restrict viewer access` と trusted key group を再確認
+- `photoObjectKey` と S3 キーが一致しているか確認
+
+## 症状C: S3 直アクセスできてしまう
+
+原因候補:
+- バケットポリシーが広すぎる
+- OAC の関連付け漏れ
+
+対処:
+- OAC の紐付けと S3 ポリシーを再作成
+- 「CloudFront Distribution からの `s3:GetObject` のみ許可」に戻す
+
+---
+
+## 9. セキュリティ上の注意（PII前提）
+
+- 署名 URL は有効期限内に再利用され得る。短 TTL を基本にする
+- 必要に応じて signed cookies + 認証導線を検討する
+- 本サンプルは認証実装を含まないため、本番では認可必須
+- ログ、Referer、監査証跡に URL が残る前提で運用設計する
+
+---
+
+## 10. このリポジトリとの対応表
+
+- 署名 URL 生成: `src/lib/signFacePhotoUrl.ts`
+- 環境変数バリデーション: `src/lib/cloudFrontMediaConfig.ts`
+- モックユーザー/オブジェクトキー: `src/data/mockUser.ts`
+- 画面描画: `src/app/page.tsx`, `src/components/UserProfileCard.tsx`
+
+この対応表に沿って、インフラ設定値を変えたら環境変数と `photoObjectKey` の一致を必ず確認すること。
