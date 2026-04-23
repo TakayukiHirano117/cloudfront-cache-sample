@@ -6,11 +6,11 @@ export default function Home() {
   const photoUrl = signFacePhotoUrl(mockUser.photoObjectKey);
 
   return (
-    <div className="relative min-h-full overflow-hidden bg-zinc-950">
+    <div className="relative flex min-h-dvh flex-1 flex-col overflow-hidden bg-zinc-950">
       <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(ellipse_80%_50%_at_50%_-20%,rgba(120,119,198,0.35),transparent)]" />
       <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_100%_0%,rgba(217,70,239,0.12),transparent_40%)]" />
 
-      <main className="relative mx-auto flex min-h-full max-w-5xl flex-col items-center justify-center px-4 py-16 sm:px-6 lg:px-8">
+      <main className="relative mx-auto flex min-h-dvh w-full max-w-5xl flex-1 flex-col items-center justify-center px-4 py-16 sm:px-6 lg:px-8">
         <div className="mb-10 max-w-xl text-center">
           <p className="text-xs font-semibold uppercase tracking-[0.2em] text-indigo-300/90">
             Sample
